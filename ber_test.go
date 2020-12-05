@@ -54,6 +54,7 @@ func TestBer2Der_Negatives(t *testing.T) {
 		_, err := ber2der(fixture.Input)
 		if err == nil {
 			t.Errorf("No error thrown. Expected: %s", fixture.ErrorContains)
+			t.FailNow()
 		}
 		if !strings.Contains(err.Error(), fixture.ErrorContains) {
 			t.Errorf("Unexpected error thrown.\n\tExpected: /%s/\n\tActual: %s", fixture.ErrorContains, err.Error())

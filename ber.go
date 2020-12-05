@@ -3,17 +3,24 @@ package pkcs7
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 )
 
 var encodeIndent = 0
 
 type asn1Object interface {
 	EncodeTo(writer *bytes.Buffer) error
+	TagBytes() []byte
 }
 
 type asn1Structured struct {
 	tagBytes []byte
 	content  []asn1Object
+}
+
+func (s asn1Structured) TagBytes() []byte {
+	return s.tagBytes
 }
 
 func (s asn1Structured) EncodeTo(out *bytes.Buffer) error {
@@ -39,6 +46,10 @@ type asn1Primitive struct {
 	content  []byte
 }
 
+func (s asn1Primitive) TagBytes() []byte {
+	return s.tagBytes
+}
+
 func (p asn1Primitive) EncodeTo(out *bytes.Buffer) error {
 	_, err := out.Write(p.tagBytes)
 	if err != nil {
@@ -54,22 +65,17 @@ func (p asn1Primitive) EncodeTo(out *bytes.Buffer) error {
 	return nil
 }
 
-func ber2der(ber []byte) ([]byte, error) {
-	if len(ber) == 0 {
-		return nil, errors.New("ber2der: input ber is empty")
-	}
-	//fmt.Printf("--> ber2der: Transcoding %d bytes\n", len(ber))
+func ber2der(data []byte) ([]byte, error) {
 	out := new(bytes.Buffer)
 
-	obj, _, err := readObject(ber, 0)
-	if err != nil {
+	obj, err := readObject(bytes.NewReader(data))
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
+	if obj == nil {
+		return nil, fmt.Errorf("error to parse BER")
+	}
 	obj.EncodeTo(out)
-
-	// if offset < len(ber) {
-	//	return nil, fmt.Errorf("ber2der: Content longer than expected. Got %d, expected %d", offset, len(ber))
-	//}
 
 	return out.Bytes(), nil
 }
@@ -132,120 +138,98 @@ func encodeLength(out *bytes.Buffer, length int) (err error) {
 	return
 }
 
-func readObject(ber []byte, offset int) (asn1Object, int, error) {
-	berLen := len(ber)
-	if offset >= berLen {
-		return nil, 0, errors.New("ber2der: offset is after end of ber data")
+func readObject(r *bytes.Reader) (obj asn1Object, err error) {
+	var tagB byte
+	if tagB, err = r.ReadByte(); err != nil {
+		return
 	}
-	tagStart := offset
-	b := ber[offset]
-	offset++
-	if offset >= berLen {
-		return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
-	}
-	tag := b & 0x1F // last 5 bits
-	if tag == 0x1F {
-		tag = 0
-		for ber[offset] >= 0x80 {
-			tag = tag*128 + ber[offset] - 0x80
-			offset++
-			if offset > berLen {
-				return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
-			}
-		}
-		// jvehent 20170227: this doesn't appear to be used anywhere...
-		//tag = tag*128 + ber[offset] - 0x80
-		offset++
-		if offset > berLen {
-			return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
-		}
-	}
-	tagEnd := offset
 
-	kind := b & 0x20
-	if kind == 0 {
-		debugprint("--> Primitive\n")
-	} else {
-		debugprint("--> Constructed\n")
+	primitive := tagB&0x20 == 0
+
+	var l byte
+	if l, err = r.ReadByte(); err != nil {
+		return nil, fmt.Errorf("end of ber data reached")
 	}
-	// read length
-	var length int
-	l := ber[offset]
-	offset++
-	if offset > berLen {
-		return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
-	}
-	hack := 0
+	length := (int)(l & 0x7F)
 	if l > 0x80 {
-		numberOfBytes := (int)(l & 0x7F)
+		numberOfBytes := length
+		length = 0
 		if numberOfBytes > 4 { // int is only guaranteed to be 32bit
-			return nil, 0, errors.New("ber2der: BER tag length too long")
+			return nil, errors.New("ber2der: BER tag length too long")
 		}
-		if numberOfBytes == 4 && (int)(ber[offset]) > 0x7F {
-			return nil, 0, errors.New("ber2der: BER tag length is negative")
-		}
-		if 0x0 == (int)(ber[offset]) {
-			return nil, 0, errors.New("ber2der: BER tag length has leading zero")
-		}
-		debugprint("--> (compute length) indicator byte: %x\n", l)
-		debugprint("--> (compute length) length bytes: % X\n", ber[offset:offset+numberOfBytes])
 		for i := 0; i < numberOfBytes; i++ {
-			length = length*256 + (int)(ber[offset])
-			offset++
-			if offset > berLen {
-				return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
+			var sl byte
+			if sl, err = r.ReadByte(); err != nil {
+				return nil, fmt.Errorf("length is more than available data")
 			}
+			if i == 0 {
+				if numberOfBytes == 4 && (int)(sl) > 0x7F {
+					return nil, errors.New("ber2der: BER tag length is negative")
+				}
+				if 0x0 == (int)(sl) {
+					return nil, errors.New("ber2der: BER tag length has leading zero")
+				}
+			}
+			length = length*256 + (int)(sl)
 		}
-	} else if l == 0x80 {
-		// find length by searching content
-		markerIndex := bytes.LastIndex(ber[offset:], []byte{0x0, 0x0})
-		if markerIndex == -1 {
-			return nil, 0, errors.New("ber2der: Invalid BER format")
-		}
-		length = markerIndex
-		hack = 2
-		debugprint("--> (compute length) marker found at offset: %d\n", markerIndex+offset)
-	} else {
-		length = (int)(l)
 	}
-	if length < 0 {
-		return nil, 0, errors.New("ber2der: invalid negative value found in BER tag length")
-	}
-	//fmt.Printf("--> length        : %d\n", length)
-	contentEnd := offset + length
-	if contentEnd > len(ber) {
-		return nil, 0, errors.New("ber2der: BER tag length is more than available data")
-	}
-	debugprint("--> content start : %d\n", offset)
-	debugprint("--> content end   : %d\n", contentEnd)
-	debugprint("--> content       : % X\n", ber[offset:contentEnd])
-	var obj asn1Object
-	if kind == 0 {
-		obj = asn1Primitive{
-			tagBytes: ber[tagStart:tagEnd],
+
+	if primitive {
+		p := asn1Primitive{
+			tagBytes: []byte{tagB},
 			length:   length,
-			content:  ber[offset:contentEnd],
+			content:  make([]byte, length),
 		}
+		if length > 0 {
+			_, err = r.Read(p.content)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Invalid BER format")
+		}
+		obj = p
+		return
 	} else {
 		var subObjects []asn1Object
-		for offset < contentEnd {
-			var subObj asn1Object
-			var err error
-			subObj, offset, err = readObject(ber[:contentEnd], offset)
+		var sobj asn1Object
+		if length > 0 {
+			content := make([]byte, length)
+			n, err := r.Read(content)
 			if err != nil {
-				return nil, 0, err
+				return nil, err
 			}
-			subObjects = append(subObjects, subObj)
+			if n != length {
+				return nil, fmt.Errorf("length is more than available data")
+			}
+			r = bytes.NewReader(content)
+		}
+		for {
+			sobj, err = readObject(r)
+			if err != nil && err != io.EOF {
+				return
+			}
+			if err == io.EOF && length > 0 {
+				err = nil
+				break
+			}
+			if sobj == nil {
+				break
+			}
+			if po, ok := sobj.(asn1Primitive); ok {
+				if po.length == 0 && po.tagBytes[0] == 0 && length == 0 {
+					break
+				}
+			}
+			subObjects = append(subObjects, sobj)
+
+			if err != nil {
+				break
+			}
 		}
 		obj = asn1Structured{
-			tagBytes: ber[tagStart:tagEnd],
+			tagBytes: []byte{tagB},
 			content:  subObjects,
 		}
+		return
 	}
-
-	return obj, contentEnd + hack, nil
-}
-
-func debugprint(format string, a ...interface{}) {
-	//fmt.Printf(format, a)
+	return nil, io.EOF
 }

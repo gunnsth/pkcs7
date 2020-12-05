@@ -12,6 +12,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 
 	_ "crypto/sha1" // for crypto.SHA1
@@ -158,7 +159,7 @@ func Parse(data []byte) (p7 *PKCS7, err error) {
 	}
 	var info contentInfo
 	der, err := ber2der(data)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	rest, err := asn1.Unmarshal(der, &info)
